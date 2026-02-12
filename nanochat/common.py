@@ -5,7 +5,11 @@ Common utilities for nanochat.
 import os
 import re
 import logging
-import fcntl
+import sys
+if sys.platform == 'win32':
+    import msvcrt
+else:
+    import fcntl
 import urllib.request
 import torch
 import torch.distributed as dist
@@ -74,7 +78,10 @@ def download_file_with_lock(url, filename):
 
         # Only a single rank can acquire this lock
         # All other ranks block until it is released
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        if sys.platform == 'win32':
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
 
         if os.path.exists(file_path):
             return file_path

@@ -31,6 +31,10 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (MQA)
     n_embd: int = 768
+    # Titans memory (MAL variant)
+    use_titans: bool = False
+    titans_memory_dim: int = 512
+    titans_memory_depth: int = 3
 
 
 def norm(x):
@@ -144,6 +148,16 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # Titans memory layer (MAL variant) — inserted after transformer blocks
+        if config.use_titans:
+            from nanochat.titans_memory import TitansLayer
+            self.titans_layer = TitansLayer(
+                model_dim=config.n_embd,
+                memory_dim=config.titans_memory_dim,
+                memory_depth=config.titans_memory_depth,
+            )
+        else:
+            self.titans_layer = None
         # To support meta device initialization, we init the rotary embeddings here, but it's fake
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them, but assert fail if we ever reach that amount.
@@ -213,11 +227,12 @@ class GPT(nn.Module):
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
-        # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
+        # Separate out all parameters into groups (matrix, embedding, lm_head, and optionally titans)
         matrix_params = list(self.transformer.h.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
+        titans_params = list(self.titans_layer.parameters()) if self.titans_layer is not None else []
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(titans_params)
         # Create the AdamW optimizer for the embedding and lm_head
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -227,6 +242,9 @@ class GPT(nn.Module):
             dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
             dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
         ]
+        # Titans memory params go into AdamW (memory uses internal gradient-based updates, outer optimizer is AdamW)
+        if titans_params:
+            adam_groups.append(dict(params=titans_params, lr=unembedding_lr * dmodel_lr_scale))
         adamw_kwargs = dict(betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay)
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
@@ -257,6 +275,9 @@ class GPT(nn.Module):
         x = norm(x)
         for block in self.transformer.h:
             x = block(x, cos_sin, kv_cache)
+        # Apply Titans memory layer (MAL) if enabled
+        if self.titans_layer is not None:
+            x = self.titans_layer(x, update_memory=(targets is not None))
         x = norm(x)
 
         # Forward the lm_head (compute logits)
