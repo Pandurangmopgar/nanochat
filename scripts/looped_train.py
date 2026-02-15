@@ -57,7 +57,7 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe")
 # Model architecture
-parser.add_argument("--depth", type=int, default=20, help="equivalent depth (used for model_dim = depth * aspect_ratio)")
+parser.add_argument("--depth", type=int, default=36, help="equivalent depth (used for model_dim = depth * aspect_ratio)")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
