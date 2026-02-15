@@ -157,7 +157,11 @@ class HuggingFaceTokenizer:
 # -----------------------------------------------------------------------------
 # Tokenizer based on rustbpe + tiktoken combo
 import pickle
-import rustbpe
+try:
+    import rustbpe
+    HAS_RUSTBPE = True
+except ImportError:
+    HAS_RUSTBPE = False
 import tiktoken
 
 class RustBPETokenizer:
@@ -391,8 +395,11 @@ def get_tokenizer():
     from nanochat.common import get_base_dir
     base_dir = get_base_dir()
     tokenizer_dir = os.path.join(base_dir, "tokenizer")
-    # return HuggingFaceTokenizer.from_directory(tokenizer_dir)
-    return RustBPETokenizer.from_directory(tokenizer_dir)
+    if HAS_RUSTBPE:
+        return RustBPETokenizer.from_directory(tokenizer_dir)
+    else:
+        print("RustBPE not found, falling back to HuggingFaceTokenizer")
+        return HuggingFaceTokenizer.from_directory(tokenizer_dir)
 
 def get_token_bytes(device="cpu"):
     import torch
