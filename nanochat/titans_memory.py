@@ -158,10 +158,12 @@ class TitansMemory(nn.Module):
             # (bfloat16 autocast can cause precision loss in the inner loop)
             with torch.amp.autocast(device_type=x.device.type, enabled=False):
                 mem_out_f32 = mem_out.float()
+                # Cast x_conv to float32 — it may be BFloat16 from outer autocast
+                x_conv_f32 = x_conv.float()
                 # Project to values (Eq. 11)
                 # Not detached — create_graph=False prevents 2nd-order grads,
                 # and W_V gets outer-loop gradients via retain_graph=True
-                values_f32 = self.W_V(x_conv).float()
+                values_f32 = self.W_V(x_conv_f32)
 
                 # Compute associative memory loss (Eq. 12): ||M(k_t) - v_t||²
                 loss = F.mse_loss(mem_out_f32, values_f32)
