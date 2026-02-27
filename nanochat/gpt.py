@@ -25,6 +25,19 @@ from nanochat.optim import MuonAdamW, DistMuonAdamW
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
 
+# MoE and Titans imports (lazy — only used when config enables them)
+def _get_moe_mlp():
+    from nanochat.moe import MoEMLP, init_moe_weights
+    return MoEMLP, init_moe_weights
+
+def _get_titans_layer():
+    from nanochat.titans_memory import TitansLayer
+    return TitansLayer
+
+def _get_continuum_titans_layer():
+    from nanochat.titans_memory import ContinuumTitansLayer
+    return ContinuumTitansLayer
+
 @dataclass
 class GPTConfig:
     sequence_len: int = 2048
@@ -37,6 +50,21 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # MoE configuration
+    use_moe: bool = False
+    num_experts: int = 4
+    top_k_experts: int = 2
+    moe_every_n: int = 2       # Apply MoE every Nth layer (others stay dense)
+    expert_dim: int = 0        # Expert hidden dim (0 = auto: 2 * n_embd)
+    aux_loss_weight: float = 0.01  # Load balancing loss weight
+    # Titans Neural Memory configuration
+    use_titans: bool = False
+    titans_memory_dim: int = 512
+    titans_memory_depth: int = 3
+    titans_every_n: int = 4    # Insert Titans layer every Nth block
+    titans_continuum: bool = False  # Use multi-timescale ContinuumTitansLayer
+    titans_num_timescales: int = 3  # Number of memory timescales (fast/medium/slow)
+    titans_update_intervals: tuple = (1, 4, 16)  # Update frequency per timescale
 
 
 def norm(x):
@@ -135,7 +163,20 @@ class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        # Use MoE MLP for selected layers, dense MLP for others
+        self.is_moe = config.use_moe and (layer_idx % config.moe_every_n == 0)
+        if self.is_moe:
+            MoEMLP, _ = _get_moe_mlp()
+            expert_dim = config.expert_dim if config.expert_dim > 0 else 2 * config.n_embd
+            self.mlp = MoEMLP(
+                n_embd=config.n_embd,
+                num_experts=config.num_experts,
+                top_k=config.top_k_experts,
+                expert_dim=expert_dim,
+                aux_loss_weight=config.aux_loss_weight,
+            )
+        else:
+            self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
@@ -176,6 +217,36 @@ class GPT(nn.Module):
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
 
+        # Titans Neural Memory layers (inserted after every titans_every_n blocks)
+        self.titans_layer = None  # single reference for compatibility with titans_base_train.py
+        self.titans_layers = nn.ModuleDict()
+        if config.use_titans:
+            if config.titans_continuum:
+                # Multi-timescale memory (HOPE-inspired)
+                ContinuumTitansLayer = _get_continuum_titans_layer()
+                for i in range(config.n_layer):
+                    if (i + 1) % config.titans_every_n == 0:
+                        self.titans_layers[str(i)] = ContinuumTitansLayer(
+                            model_dim=config.n_embd,
+                            memory_dim=config.titans_memory_dim,
+                            memory_depth=config.titans_memory_depth,
+                            num_timescales=config.titans_num_timescales,
+                            update_intervals=config.titans_update_intervals,
+                        )
+            else:
+                # Single-timescale memory (original Titans)
+                TitansLayer = _get_titans_layer()
+                for i in range(config.n_layer):
+                    if (i + 1) % config.titans_every_n == 0:
+                        self.titans_layers[str(i)] = TitansLayer(
+                            model_dim=config.n_embd,
+                            memory_dim=config.titans_memory_dim,
+                            memory_depth=config.titans_memory_depth,
+                        )
+            # Set titans_layer to first one for backward compat with titans_base_train.py
+            if len(self.titans_layers) > 0:
+                self.titans_layer = list(self.titans_layers.values())[0]
+
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -200,6 +271,8 @@ class GPT(nn.Module):
             attn.c_proj:     zeros
             mlp.c_fc:        uniform, std=1/sqrt(n_embd)
             mlp.c_proj:      zeros
+        MoE experts: same as MLP, router: small normal init
+        Titans: default init from TitansLayer constructor
         """
 
         # Embedding and unembedding
@@ -214,8 +287,14 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if block.is_moe:
+                # MoE layers: init each expert like a standard MLP, router with small normal
+                _, init_moe = _get_moe_mlp()
+                init_moe(block.mlp, n_embd)
+            else:
+                # Dense MLP
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)   # 1.0 => typical residual connections at init
@@ -229,6 +308,9 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
+
+        # Titans layers use their own init from __init__ (sensible defaults already set)
+        # No additional init needed here.
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -294,19 +376,42 @@ class GPT(nn.Module):
         """
         Return the estimated FLOPs per token for the model (forward + backward).
         Each matmul weight parameter contributes 2 FLOPs (multiply *, accumulate +) in forward, and 2X that in backward => 2+4=6.
-        Cleanest explanation of this: https://medium.com/@dzmitrybahdanau/the-flops-calculus-of-language-model-training-3b19c1f025e4
-        On top of that, 12 * h * q * effective_seq_len accounts for key @ query matmul flops inside attention.
-        With sliding windows, effective_seq_len varies per layer (capped by window size).
-        Ref: https://arxiv.org/abs/2204.02311 (PaLM paper).
-        This is ~1% off from the exact formulas of Chinchilla paper, the difference is:
-        - Chinchilla counts the embedding layer as flops (? weird, it's just a lookup => we ignore)
-        - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
+        For MoE layers, only top_k/num_experts fraction of expert params are active per token.
+        Titans memory FLOPs are counted fully (they run on every token).
         """
-        nparams = sum(p.numel() for p in self.parameters())
-        # Exclude non-matmul params: embeddings and per-layer scalars
+        # Count active params (accounting for MoE sparsity)
+        active_params = 0
+        exclude_params = 0
+
+        # Embeddings and scalars: not matmul FLOPs
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
+        exclude_params += (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel())
+
+        # Per-block params: attention is always active, MLP depends on MoE
+        for block in self.transformer.h:
+            # Attention params: always fully active
+            attn_params = sum(p.numel() for p in block.attn.parameters())
+            active_params += attn_params
+
+            if block.is_moe:
+                # MoE: router is always active, experts are top_k/num_experts active
+                router_params = block.mlp.gate.weight.numel()
+                expert_params = sum(p.numel() for expert in block.mlp.experts for p in expert.parameters())
+                sparsity = self.config.top_k_experts / self.config.num_experts
+                active_params += router_params + expert_params * sparsity
+            else:
+                # Dense MLP: fully active
+                mlp_params = sum(p.numel() for p in block.mlp.parameters())
+                active_params += mlp_params
+
+        # LM head: always active
+        active_params += sum(p.numel() for p in self.lm_head.parameters())
+
+        # Titans: fully active (runs on every token)
+        titans_params = sum(p.numel() for p in self.titans_layers.parameters())
+        active_params += titans_params
+
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -314,34 +419,45 @@ class GPT(nn.Module):
             window = window_size[0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
+        num_flops_per_token = 6 * active_params + attn_flops
         return num_flops_per_token
 
     def num_scaling_params(self):
         """
         Return detailed parameter counts for scaling law analysis.
-        Different papers use different conventions:
-        - Kaplan et al. excluded embedding parameters
-        - Chinchilla included all parameters
-        Ref: https://arxiv.org/abs/2203.15556 (Chinchilla paper)
-        Ref: https://arxiv.org/abs/2001.08361 (Kaplan et al. original scaling laws paper)
-
-        Returns a dict with counts for each parameter group, so downstream analysis
-        can experiment with which combination gives the cleanest scaling laws.
+        Includes MoE and Titans parameter breakdowns.
         """
-        # Count each group separately (mirrors the grouping in setup_optimizers)
+        # Count each group separately
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
-        assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
+        titans_params = sum(p.numel() for p in self.titans_layers.parameters())
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars + titans_params
+        assert total == sum(p.numel() for p in self.parameters()), f"Parameter count mismatch: {total} != {sum(p.numel() for p in self.parameters())}"
+
+        # Count MoE-specific params for reporting
+        moe_expert_params = 0
+        moe_router_params = 0
+        dense_mlp_params = 0
+        for block in self.transformer.h:
+            if block.is_moe:
+                moe_router_params += block.mlp.gate.weight.numel()
+                moe_expert_params += sum(p.numel() for expert in block.mlp.experts for p in expert.parameters())
+            else:
+                moe_expert_params += 0
+                dense_mlp_params += sum(p.numel() for p in block.mlp.parameters())
+
         return {
             'wte': wte,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
+            'moe_expert_params': moe_expert_params,
+            'moe_router_params': moe_router_params,
+            'dense_mlp_params': dense_mlp_params,
+            'titans_params': titans_params,
             'scalars': scalars,
             'total': total,
         }
@@ -351,13 +467,20 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
+        # Note: matrix_params from transformer.h include both dense MLP and MoE expert params
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+
+        # Titans params get AdamW (meta-learning params shouldn't use Muon)
+        titans_params = list(self.titans_layers.parameters())
+
+        all_params = (len(matrix_params) + len(embedding_params) + len(lm_head_params) +
+                      len(value_embeds_params) + len(resid_params) + len(x0_params) + len(titans_params))
+        assert len(list(self.parameters())) == all_params, f"Param count mismatch: {len(list(self.parameters()))} != {all_params}"
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -373,6 +496,11 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
 
+        # Titans params: use AdamW with smaller LR (meta-learning is sensitive)
+        if titans_params:
+            param_groups.append(
+                dict(kind='adamw', params=titans_params, lr=0.001 * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0)
+            )
 
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
@@ -403,10 +531,17 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # embed current token
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
+        total_aux_loss = 0.0  # accumulate MoE auxiliary losses
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            # Accumulate MoE auxiliary loss
+            if block.is_moe and self.training:
+                total_aux_loss = total_aux_loss + block.mlp.aux_loss
+            # Apply Titans memory layer after designated blocks
+            if str(i) in self.titans_layers:
+                x = self.titans_layers[str(i)](x, update_memory=self.training)
 
         x = norm(x)
 
@@ -419,8 +554,10 @@ class GPT(nn.Module):
 
         if targets is not None:
             # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            # Add MoE auxiliary loss for load balancing
+            if self.config.use_moe:
+                loss = loss + total_aux_loss
             return loss
         else:
             # inference: just return the logits directly

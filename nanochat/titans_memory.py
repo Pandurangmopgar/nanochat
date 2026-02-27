@@ -271,3 +271,206 @@ class TitansLayer(nn.Module):
         output = x + gate * (mem_out - x_normed)
 
         return output
+
+
+# =============================================================================
+# Multi-Timescale Memory (Upgrade 2 — inspired by HOPE / Nested Learning)
+# =============================================================================
+#
+# Instead of one memory module, we use 2-3 memory networks updating at
+# different frequencies, creating a continuum of memory timescales:
+#
+#   Fast memory   (updates every token)     — working memory / immediate context
+#   Medium memory (updates every N tokens)  — episodic memory / recent patterns
+#   Slow memory   (updates every M tokens)  — semantic memory / stable knowledge
+#
+# Each timescale has its own TitansMemory with different hyperparameter inits:
+#   - Fast:  high learning rate, high forgetting (α~0.05) → rapid adaptation
+#   - Medium: moderate LR, moderate forgetting (α~0.01) → pattern consolidation
+#   - Slow:  low learning rate, very low forgetting (α~0.001) → stable knowledge
+#
+# A learned mixer (linear + softmax) combines outputs from all timescales,
+# allowing the model to dynamically weight which memory is most useful.
+#
+# Reference:
+#   HOPE / Nested Learning (Behrouz et al., Nov 2025, Google Research)
+#   "Nested Learning: The Illusion of Deep Learning Architectures"
+#   Key idea: Continuum Memory System with multi-timescale update frequencies
+
+
+class ContinuumMemory(nn.Module):
+    """
+    Multi-timescale neural memory module.
+
+    Creates multiple TitansMemory instances that update at different
+    frequencies (fast/medium/slow), inspired by HOPE's Continuum Memory.
+
+    Args:
+        model_dim: Dimension of the input/output
+        memory_dim: Hidden dimension for the memory MLPs
+        memory_depth: Number of hidden layers per memory MLP
+        num_timescales: Number of memory timescales (2 or 3)
+        update_intervals: Update frequencies for each timescale.
+                         Default: (1, 4, 16) for fast/medium/slow.
+        scale_memory_dim: If True, scale memory_dim inversely with num_timescales
+                         to keep total param count similar to a single large memory.
+    """
+
+    def __init__(
+        self,
+        model_dim: int,
+        memory_dim: int = 512,
+        memory_depth: int = 3,
+        num_timescales: int = 3,
+        update_intervals: tuple = (1, 4, 16),
+        scale_memory_dim: bool = True,
+    ):
+        super().__init__()
+        assert num_timescales >= 2, "Need at least 2 timescales"
+        assert len(update_intervals) >= num_timescales
+
+        self.model_dim = model_dim
+        self.num_timescales = num_timescales
+        self.update_intervals = update_intervals[:num_timescales]
+
+        # Scale memory_dim so total params ≈ single memory with full memory_dim
+        if scale_memory_dim:
+            per_scale_dim = max(64, memory_dim // num_timescales)
+        else:
+            per_scale_dim = memory_dim
+
+        # Create one TitansMemory per timescale
+        self.memories = nn.ModuleList()
+        for i in range(num_timescales):
+            mem = TitansMemory(
+                model_dim=model_dim,
+                memory_dim=per_scale_dim,
+                memory_depth=memory_depth,
+            )
+            # Customize hyperparameter init per timescale:
+            # Fast (i=0):  high θ (LR), high α (forgetting)
+            # Medium (i=1): moderate θ, moderate α
+            # Slow (i=2):  low θ, very low α
+            with torch.no_grad():
+                if i == 0:  # Fast memory
+                    nn.init.constant_(mem.proj_alpha.bias, -3.0)   # sigmoid(-3.0) ≈ 0.05
+                    nn.init.constant_(mem.proj_eta.bias, 1.5)      # sigmoid(1.5) ≈ 0.82
+                    nn.init.constant_(mem.proj_theta.bias, -2.5)   # softplus(-2.5) ≈ 0.08
+                elif i == 1:  # Medium memory
+                    nn.init.constant_(mem.proj_alpha.bias, -4.6)   # sigmoid(-4.6) ≈ 0.01
+                    nn.init.constant_(mem.proj_eta.bias, 2.2)      # sigmoid(2.2) ≈ 0.9
+                    nn.init.constant_(mem.proj_theta.bias, -3.9)   # softplus(-3.9) ≈ 0.02
+                else:  # Slow memory (i >= 2)
+                    nn.init.constant_(mem.proj_alpha.bias, -6.9)   # sigmoid(-6.9) ≈ 0.001
+                    nn.init.constant_(mem.proj_eta.bias, 3.0)      # sigmoid(3.0) ≈ 0.95
+                    nn.init.constant_(mem.proj_theta.bias, -5.3)   # softplus(-5.3) ≈ 0.005
+
+            self.memories.append(mem)
+
+        # Learned mixer: combines outputs from all timescales
+        # Projects each memory output to a scalar weight, then softmax across timescales
+        self.mixer = nn.Linear(model_dim, num_timescales, bias=True)
+        # Init: equal weighting across timescales
+        nn.init.zeros_(self.mixer.weight)
+        nn.init.zeros_(self.mixer.bias)
+
+        # Step counter for determining which timescales to update
+        self._step_count = 0
+
+    def forward(self, x, update_memory=True):
+        """
+        Args:
+            x: Input tensor of shape (B, T, D)
+            update_memory: Whether to update memory parameters
+
+        Returns:
+            Combined memory output of shape (B, T, D)
+        """
+        B, T, D = x.shape
+
+        # Collect outputs from all timescales
+        memory_outputs = []
+        for i, (mem, interval) in enumerate(zip(self.memories, self.update_intervals)):
+            # Determine whether this timescale should update
+            should_update = update_memory and (self._step_count % interval == 0)
+            mem_out = mem(x, update_memory=should_update)
+            memory_outputs.append(mem_out)
+
+        # Stack: (B, T, num_timescales, D)
+        stacked = torch.stack(memory_outputs, dim=2)
+
+        # Compute mixing weights from input (B, T, num_timescales)
+        mix_weights = torch.softmax(self.mixer(x), dim=-1)  # (B, T, num_timescales)
+
+        # Weighted combination: (B, T, D)
+        # mix_weights: (B, T, num_timescales) -> (B, T, num_timescales, 1)
+        # stacked:     (B, T, num_timescales, D)
+        combined = (stacked * mix_weights.unsqueeze(-1)).sum(dim=2)
+
+        # Increment step counter
+        if update_memory and self.training:
+            self._step_count += 1
+
+        return combined
+
+    def reset_memory_state(self):
+        """Reset all timescale memory states."""
+        self._step_count = 0
+        for mem in self.memories:
+            mem.reset_memory_state()
+
+
+class ContinuumTitansLayer(nn.Module):
+    """
+    MAL (Memory as Layer) wrapper using multi-timescale ContinuumMemory.
+
+    Drop-in replacement for TitansLayer with multi-timescale memory.
+    Uses the same gating mechanism as TitansLayer.
+
+    Args:
+        model_dim: Dimension of the input/output
+        memory_dim: Hidden dimension for memory MLPs
+        memory_depth: Number of hidden layers per memory MLP
+        num_timescales: Number of memory timescales (default: 3)
+        update_intervals: Update frequencies per timescale (default: 1, 4, 16)
+    """
+
+    def __init__(
+        self,
+        model_dim: int,
+        memory_dim: int = 512,
+        memory_depth: int = 3,
+        num_timescales: int = 3,
+        update_intervals: tuple = (1, 4, 16),
+    ):
+        super().__init__()
+        self.memory = ContinuumMemory(
+            model_dim=model_dim,
+            memory_dim=memory_dim,
+            memory_depth=memory_depth,
+            num_timescales=num_timescales,
+            update_intervals=update_intervals,
+        )
+        # Learned gate (same design as TitansLayer)
+        self.gate = nn.Linear(model_dim, model_dim, bias=True)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, -2.0)  # sigmoid(-2) ≈ 0.12
+
+    def forward(self, x, update_memory=True):
+        """
+        Args:
+            x: Input tensor of shape (B, T, D)
+            update_memory: Whether to update memory
+
+        Returns:
+            Output tensor of shape (B, T, D)
+        """
+        x_normed = F.rms_norm(x, (x.size(-1),))
+        mem_out = self.memory(x_normed, update_memory=update_memory)
+        gate = torch.sigmoid(self.gate(x_normed))
+        output = x + gate * (mem_out - x_normed)
+        return output
+
+    def reset_memory_state(self):
+        """Reset all memory states."""
+        self.memory.reset_memory_state()
