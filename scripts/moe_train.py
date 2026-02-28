@@ -247,11 +247,11 @@ def disable_fp8(model):
 orig_model = model
 has_titans = model.config.use_titans and len(model.titans_layers) > 0
 if has_titans:
-    # Compile transformer blocks and lm_head separately, leave titans_layers uncompiled
-    # TitansLayer uses torch.autograd.grad() + p.data mutations which break torch.compile
-    model.transformer = torch.compile(model.transformer, dynamic=False)
-    model.lm_head = torch.compile(model.lm_head, dynamic=False)
-    print0("✓ Compiled model (excluding Titans layers for autograd.grad compatibility)")
+    # Skip torch.compile entirely when Titans memory is enabled.
+    # TitansMemory uses torch.autograd.grad() + p.data mutations, and
+    # ContinuumMemory has dynamic step counters — both are fundamentally
+    # incompatible with torch.compile's graph tracing.
+    print0("⚠ Skipping torch.compile (Titans memory layers use autograd.grad which breaks compilation)")
 else:
     model = torch.compile(model, dynamic=False)
 
